@@ -50,6 +50,9 @@ Currently still runs against a hardcoded scikit-learn breast-cancer
 baseline and executes locally, same as the coursework version — the E2B
 sandbox swap and dataset generalization are the next steps.
 
+See [`DESIGN.md`](DESIGN.md) for the full decisions log — why E2B over
+CoreWeave, the planned multi-tenant architecture, and safety/cost caps.
+
 ## Roadmap
 
 - [ ] Swap local subprocess execution for a real E2B sandbox (in progress)
