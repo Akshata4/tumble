@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .workspace/
+sessions/
 trajectories/
 best_train.py
 REPORT.md

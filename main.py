@@ -1,123 +1,42 @@
-import json
+import argparse
 import os
 import shutil
-import sys
 
 from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())
 os.environ["LLM_PROVIDER"] = "wandb"  # Tumble is W&B-only by design, regardless of what's in .env
 
-from llm_client import get_client_and_model  # noqa: E402
-from tools import TOOL_FUNCTIONS, TOOL_SCHEMAS, WORKSPACE_ROOT  # noqa: E402
+from agent_loop import run_agent  # noqa: E402
+from dataset_preview import build_preview  # noqa: E402
+from prompts import default_prompt, build_system_prompt  # noqa: E402
+from sandbox_exec import SandboxSession  # noqa: E402
+from tools import TOOL_SCHEMAS, Workspace  # noqa: E402
 from trajectory import Trajectory, replay_file  # noqa: E402
 
-ROUND_BUDGET = 12
-MAX_TURNS = 40
+WORKSPACE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".workspace")
 
 
-def _safe_parse_args(raw: str) -> tuple[dict | None, str | None]:
-    try:
-        return json.loads(raw), None
-    except json.JSONDecodeError as e:
-        return None, str(e)
+def _print_event(event: dict) -> None:
+    """The CLI's view of a run: subscribed to the Trajectory so the exact
+    same event stream a server session would push over SSE prints here."""
+    etype = event["type"]
+    turn_prefix = f"[turn {event['turn']}] " if event.get("turn") is not None else ""
 
-SYSTEM_PROMPT = f"""You are an autonomous ML research scientist. Your job is to improve the
-validation accuracy of a classifier on the scikit-learn breast-cancer dataset,
-defined in train.py, by iteratively editing it and running experiments.
-
-Rules:
-- train.py must keep printing exactly one line "METRIC: <float>" as its last
-  output line -- that's how your score is read. The train/test split's
-  random_state must stay 42 so scores are comparable across attempts.
-- Use read_file to see the current train.py before changing it.
-- Use write_file to propose one change at a time, then call run_experiment
-  with a one-sentence description of what you changed.
-- run_experiment automatically keeps your change if it beats the best score
-  so far, or reverts it back to the last kept version if it doesn't (or if
-  it errors). You do not decide this -- the harness does, deterministically.
-- Use get_history any time to see every attempt so far so you don't repeat
-  yourself or lose track of what's already been tried.
-- You have a budget of {ROUND_BUDGET} experiments (run_experiment calls).
-  Track this yourself with get_history. Once you've used your budget, or you
-  believe further iteration won't meaningfully help, write a final research
-  report to REPORT.md (via write_file) summarizing what you tried, what
-  worked and what didn't, and your final best score and why -- then stop
-  (reply with plain text and no further tool calls).
-"""
-
-
-def run(prompt: str) -> None:
-    client, model = get_client_and_model()
-    provider = os.environ.get("LLM_PROVIDER", "wandb")
-    print(f"[provider={provider} model={model}]\n")
-
-    trajectory = Trajectory(provider, model)
-    trajectory.log_system(SYSTEM_PROMPT)
-    trajectory.log_user(prompt)
-    print(f"[trajectory] logging this run to {trajectory.path}\n")
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
-
-    for turn in range(1, MAX_TURNS + 1):
-        response = client.chat.completions.create(model=model, messages=messages, tools=TOOL_SCHEMAS)
-        assistant_message = response.choices[0].message
-        parsed_calls = [(c, *_safe_parse_args(c.function.arguments)) for c in (assistant_message.tool_calls or [])]
-
-        # Sanitize before storing: a malformed arguments string must never be
-        # resent to the API in the conversation history on a later turn, or
-        # the API itself rejects the *whole request* server-side (not just
-        # our own local json.loads), which would crash every future turn too.
-        dumped = assistant_message.model_dump(exclude_none=True)
-        if dumped.get("tool_calls"):
-            for tc, (_, _, err) in zip(dumped["tool_calls"], parsed_calls):
-                if err is not None:
-                    tc["function"]["arguments"] = "{}"
-        messages.append(dumped)
-
-        tool_calls_log = None
-        if parsed_calls:
-            tool_calls_log = [
-                {"id": c.id, "name": c.function.name, "args": args if args is not None else {"_parse_error": err}}
-                for c, args, err in parsed_calls
-            ]
-        trajectory.log_assistant(assistant_message.content, tool_calls_log)
-
-        if not assistant_message.tool_calls:
-            print(assistant_message.content)
-            trajectory.close()
-            _finalize_artifacts()
-            return
-
-        for call, args, parse_error in parsed_calls:
-            fn_name = call.function.name
-
-            if parse_error is not None:
-                # A model can emit malformed tool-call JSON (e.g. a corrupted
-                # token mid-generation). That must never crash the harness --
-                # tell the model so it can retry with valid arguments instead.
-                result = f"Error: your arguments for {fn_name} were not valid JSON ({parse_error}). Please retry this tool call with valid JSON arguments."
-                print(f"[turn {turn}] tool call: {fn_name}(<malformed JSON>)")
-                print(f"    -> {result}")
-                trajectory.log_tool_result(fn_name, {}, result)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-                continue
-
-            print(f"[turn {turn}] tool call: {fn_name}({args})")
-
-            result = TOOL_FUNCTIONS[fn_name](**args)
-            preview = result if len(result) <= 300 else result[:300] + " [truncated]"
-            print(f"    -> {preview}")
-
-            trajectory.log_tool_result(fn_name, args, result)
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-
-    print(f"\n[stopped after {MAX_TURNS} turns without a final answer]")
-    trajectory.close()
-    _finalize_artifacts()
+    if etype == "meta":
+        print(f"[provider={event['provider']} model={event['model']}]\n")
+    elif etype == "assistant":
+        tool_calls = event.get("tool_calls") or []
+        for call in tool_calls:
+            print(f"{turn_prefix}tool call: {call['name']}({call['args']})")
+        if not tool_calls and event.get("content"):
+            print(event["content"])
+    elif etype == "tool":
+        result = event["result"]
+        preview = result if len(result) <= 300 else result[:300] + " [truncated]"
+        print(f"    -> {preview}")
+    elif etype == "notice":
+        print(f"\n[{event['content']}]")
 
 
 def _finalize_artifacts() -> None:
@@ -137,16 +56,49 @@ def _finalize_artifacts() -> None:
         print("\n[finalize] no REPORT.md was written by the agent")
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Tumble: an autonomous ML research agent.")
+    parser.add_argument("--replay", metavar="TRAJECTORY_FILE", help="Replay a saved trajectory file instead of running.")
+    parser.add_argument("--dataset", metavar="CSV_PATH", help="Path to the CSV dataset to optimize against.")
+    parser.add_argument("--target", metavar="COLUMN", help="Name of the target column in the dataset.")
+    parser.add_argument(
+        "--metric", default="accuracy", help="Name of the metric train.py should compute and print (default: accuracy)."
+    )
+    parser.add_argument(
+        "--minimize", action="store_true", help="Lower values of --metric are better (default: higher is better)."
+    )
+    parser.add_argument("prompt", nargs="*", help="Extra natural-language instructions for the agent.")
+    return parser
+
+
 def main() -> None:
-    if len(sys.argv) >= 2 and sys.argv[1] == "--replay":
-        replay_file(sys.argv[2])
+    args = build_arg_parser().parse_args()
+
+    if args.replay:
+        replay_file(args.replay)
         return
 
-    prompt = " ".join(sys.argv[1:]) or (
-        "Improve the validation accuracy of the classifier in train.py as much as you can "
-        f"within your budget of {ROUND_BUDGET} experiments, then write your final report."
-    )
-    run(prompt)
+    if not args.dataset or not args.target:
+        build_arg_parser().error("--dataset and --target are required (unless using --replay)")
+
+    sandbox = SandboxSession(dataset_path=args.dataset, on_log=print)
+    workspace = Workspace(WORKSPACE_ROOT, sandbox, session_id="cli")
+    workspace.init(args.dataset, args.target, args.metric, args.minimize)
+
+    preview = build_preview(args.dataset, args.target)
+    system_prompt = build_system_prompt(preview, args.target, args.metric, args.minimize)
+    prompt = " ".join(args.prompt) or default_prompt(args.metric)
+
+    trajectory = Trajectory()
+    trajectory.subscribe(_print_event)
+    print(f"[trajectory] logging this run to {trajectory.path}\n")
+
+    try:
+        run_agent(prompt, system_prompt, TOOL_SCHEMAS, workspace.tool_functions(), trajectory)
+    finally:
+        sandbox.close()
+
+    _finalize_artifacts()
 
 
 if __name__ == "__main__":
